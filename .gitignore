@@ -1,0 +1,8 @@
+.pixi/
+.pytest_cache/
+.bench.lock
+__pycache__/
+*.egg-info/
+*.pyc
+*.so
+dist/
