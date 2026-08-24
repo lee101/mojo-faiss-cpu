@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import operator
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,26 @@ from ._lib import addr, f32, i64, lib
 
 METRIC_INNER_PRODUCT = 0
 METRIC_L2 = 1
+_THREAD_POOL_WORKERS = 32
+_PARALLEL_WORK = 250_000
+_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _parallel_ranges(n: int, work_size: int, max_workers: int, fn) -> None:
+    global _EXECUTOR
+    if n < 2 or work_size < _PARALLEL_WORK:
+        fn(0, n)
+        return
+    workers = min(n, max_workers)
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(max_workers=_THREAD_POOL_WORKERS)
+    chunk = (n + workers - 1) // workers
+    futures = [
+        _EXECUTOR.submit(fn, start, min(start + chunk, n))
+        for start in range(0, n, chunk)
+    ]
+    for future in futures:
+        future.result()
 
 
 def _integer(value, name: str) -> int:
@@ -368,16 +389,19 @@ class ProductQuantizer:
         if not self.is_trained:
             raise RuntimeError("ProductQuantizer is not trained")
         codes = np.empty((len(x), self.M), dtype=np.uint8)
-        if len(x):
+        def encode(start: int, end: int) -> None:
             lib().mf_pq_encode(
-                addr(x),
+                addr(x[start:end]),
                 addr(self.centroids),
-                addr(codes),
-                len(x),
+                addr(codes[start:end]),
+                end - start,
                 self.d,
                 self.M,
                 self.ksub,
             )
+
+        if len(x):
+            _parallel_ranges(len(x), len(x) * self.d * self.ksub, 8, encode)
         return codes
 
     def compute_codes(self, x) -> np.ndarray:
@@ -440,29 +464,33 @@ class IndexPQ(Index):
         tables = np.empty((len(x), self.pq.M, self.pq.ksub), dtype=np.float32)
         distances = np.empty((len(x), k), dtype=np.float32)
         labels = np.empty((len(x), k), dtype=np.int64)
-        lib().mf_pq_tables(
-            addr(x),
-            addr(self.pq.centroids),
-            addr(tables),
-            len(x),
-            self.d,
-            self.pq.M,
-            self.pq.ksub,
-            self.metric_type,
-        )
-        lib().mf_pq_scan(
-            addr(self._codes),
-            addr(self._ids),
-            addr(tables),
-            addr(distances),
-            addr(labels),
-            self.ntotal,
-            len(x),
-            self.pq.M,
-            self.pq.ksub,
-            k,
-            self.metric_type,
-        )
+        def search_rows(start: int, end: int) -> None:
+            count = end - start
+            lib().mf_pq_tables(
+                addr(x[start:end]),
+                addr(self.pq.centroids),
+                addr(tables[start:end]),
+                count,
+                self.d,
+                self.pq.M,
+                self.pq.ksub,
+                self.metric_type,
+            )
+            lib().mf_pq_scan(
+                addr(self._codes),
+                addr(self._ids),
+                addr(tables[start:end]),
+                addr(distances[start:end]),
+                addr(labels[start:end]),
+                self.ntotal,
+                count,
+                self.pq.M,
+                self.pq.ksub,
+                k,
+                self.metric_type,
+            )
+
+        _parallel_ranges(len(x), len(x) * self.ntotal * self.pq.M, 16, search_rows)
         return distances, labels
 
     def sa_encode(self, x) -> np.ndarray:
@@ -614,20 +642,24 @@ class IndexIVFFlat(_IVFBase):
         probes = self._probes(x)
         distances = np.empty((len(x), k), dtype=np.float32)
         labels = np.empty((len(x), k), dtype=np.int64)
-        lib().mf_ivf_flat_search(
-            addr(vectors),
-            addr(vector_ids),
-            addr(offsets),
-            addr(x),
-            addr(probes),
-            addr(distances),
-            addr(labels),
-            len(x),
-            self.d,
-            probes.shape[1],
-            k,
-            self.metric_type,
-        )
+        def search_rows(start: int, end: int) -> None:
+            lib().mf_ivf_flat_search(
+                addr(vectors),
+                addr(vector_ids),
+                addr(offsets),
+                addr(x[start:end]),
+                addr(probes[start:end]),
+                addr(distances[start:end]),
+                addr(labels[start:end]),
+                end - start,
+                self.d,
+                probes.shape[1],
+                k,
+                self.metric_type,
+            )
+
+        estimated = len(x) * self.ntotal * probes.shape[1] * self.d // self.nlist
+        _parallel_ranges(len(x), estimated, 8, search_rows)
         return distances, labels
 
     def reset(self) -> None:
@@ -717,25 +749,30 @@ class IndexIVFPQ(_IVFBase):
         )
         distances = np.empty((len(x), k), dtype=np.float32)
         labels = np.empty((len(x), k), dtype=np.int64)
-        lib().mf_ivfpq_search(
-            addr(codes),
-            addr(vector_ids),
-            addr(offsets),
-            addr(x),
-            addr(self._centers),
-            addr(probes),
-            addr(self.pq.centroids),
-            addr(tables),
-            addr(distances),
-            addr(labels),
-            len(x),
-            self.d,
-            self.pq.M,
-            self.pq.ksub,
-            probes.shape[1],
-            k,
-            self.metric_type,
-        )
+        def search_rows(start: int, end: int) -> None:
+            lib().mf_ivfpq_search(
+                addr(codes),
+                addr(vector_ids),
+                addr(offsets),
+                addr(x[start:end]),
+                addr(self._centers),
+                addr(probes[start:end]),
+                addr(self.pq.centroids),
+                addr(tables[start:end]),
+                addr(distances[start:end]),
+                addr(labels[start:end]),
+                end - start,
+                self.d,
+                self.pq.M,
+                self.pq.ksub,
+                probes.shape[1],
+                k,
+                self.metric_type,
+            )
+
+        table_work = probes.shape[1] * self.pq.ksub * self.d
+        scan_work = self.ntotal * probes.shape[1] * self.pq.M // self.nlist
+        _parallel_ranges(len(x), len(x) * (table_work + scan_work), 32, search_rows)
         return distances, labels
 
     def reset(self) -> None:

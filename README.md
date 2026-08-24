@@ -93,25 +93,28 @@ These are real best-of-five results from `pixi run bench`. The ratio is
 `faiss-cpu time / Mojo time`, so values above 1 mean this project was faster.
 Before timing, the benchmark checks that both implementations return identical
 neighbor IDs or codes and close distances. Faiss used its default 72 threads;
-the Mojo scan and encode kernels use up to 32 workers only after a work-size
-threshold, and stay serial for small inputs.
+large independent query and encode ranges use 8, 16, or 32 workers according to
+the kernel only after a work-size threshold, and stay serial for small inputs.
 
 Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz; Linux
 6.8.0-136-generic; faiss-cpu reported 72 threads.
 
 | Operation | Mojo | faiss-cpu | faiss/Mojo | Result |
 |---|---:|---:|---:|---|
-| IndexFlatL2.search (20k x 200, d=64, k=10) | 58.84 ms | 1181.65 ms | 20.08x | faster |
-| IndexFlatIP.search (20k x 200, d=64, k=10) | 90.03 ms | 1153.59 ms | 12.81x | faster |
-| IndexIVFFlat.search (50k x 300, d=32, nprobe=8) | 24.52 ms | 2.41 ms | 0.10x | slower |
-| IndexPQ.search (30k x 300, d=32, M=8, 4-bit) | 30.60 ms | 24.33 ms | 0.80x | slower |
-| ProductQuantizer.compute_codes (50k, d=32, M=8, 4-bit) | 21.70 ms | 2.73 ms | 0.13x | slower |
-| IndexIVFPQ.search (50k x 300, d=32, nprobe=8) | 20.02 ms | 9.62 ms | 0.48x | slower |
+| IndexFlatL2.search (20k x 200, d=64, k=10) | 57.32 ms | 1061.91 ms | 18.53x | faster |
+| IndexFlatIP.search (20k x 200, d=64, k=10) | 56.02 ms | 667.74 ms | 11.92x | faster |
+| IndexIVFFlat.search (50k x 300, d=32, nprobe=8) | 5.78 ms | 1.96 ms | 0.34x | slower |
+| IndexPQ.search (30k x 300, d=32, M=8, 4-bit) | 9.79 ms | 17.24 ms | 1.76x | faster |
+| ProductQuantizer.compute_codes (50k, d=32, M=8, 4-bit) | 6.20 ms | 1.11 ms | 0.18x | slower |
+| IndexIVFPQ.search (50k x 300, d=32, nprobe=8) | 12.76 ms | 2.00 ms | 0.16x | slower |
 
 The flat workload benefits from a compact single-threaded SIMD scan and avoids
-the overhead Faiss incurs with its 72-thread default on this query batch.
-IVF-flat, PQ search and encoding, and IVF-PQ remain slower than Faiss's mature
-specialized kernels on this run. This project has no GPU implementation.
+the overhead Faiss incurs with its 72-thread default on this query batch. PQ
+search is also faster on this run. IVF-flat, PQ encoding, and IVF-PQ remain
+slower than Faiss's mature specialized kernels. No GPU path was added: the
+distance loops perform about 0.5 FLOP per byte loaded and PQ scanning is lower,
+so they do not meet the roughly 2 FLOP/byte threshold needed to justify device
+transfer and launch overhead.
 
 ## How it works
 
@@ -119,7 +122,9 @@ Python passes NumPy buffer addresses and integer extents through `ctypes`.
 Every exported Mojo function has a non-parametric C ABI and reconstructs
 `UnsafePointer` values from those addresses. NumPy owns all allocations, so the
 shared library neither retains Python pointers nor exposes an allocator across
-the FFI boundary.
+the FFI boundary. Large row ranges are split into zero-copy NumPy views and
+dispatched concurrently; each worker calls the same compiled SIMD kernel, while
+small ranges take one direct serial call.
 
 Vectors and centroids are contiguous row-major `float32`; labels and offsets
 are `int64`. Flat L2 and inner-product reductions use eight-lane SIMD. PQ
