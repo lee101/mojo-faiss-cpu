@@ -1,15 +1,10 @@
 """Compute kernels for flat, IVF, and product-quantized vector search."""
 
-from std.algorithm import parallelize
 from std.math import sqrt
 from std.sys.info import simd_width_of
 
 comptime W = 8
 comptime PW = simd_width_of[DType.float64]()
-comptime PARALLEL_SCAN_WORK = 50_000
-comptime PARALLEL_ENCODE_WORK = 1_000_000
-comptime PARALLEL_WORKERS = 32
-comptime IVFPQ_WORKERS = 16
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
@@ -331,11 +326,8 @@ def mf_ivf_flat_search(
                 var value = score(queries + q * d, vectors + pos * d, d, metric)
                 insert_topk(distances, ids, base, k, value, vector_ids[pos], metric)
 
-    if nq > 1 and nq * nprobe * d >= PARALLEL_SCAN_WORK:
-        parallelize(search_query, nq, PARALLEL_WORKERS)
-    else:
-        for q in range(nq):
-            search_query(q)
+    for q in range(nq):
+        search_query(q)
 
 
 @export("mf_pq_encode")
@@ -382,11 +374,8 @@ def mf_pq_encode(
                         best_id = c
             codes[r * m + sub] = UInt8(best_id)
 
-    if n > 1 and n * d * ksub >= PARALLEL_ENCODE_WORK:
-        parallelize(encode_row, n, PARALLEL_WORKERS)
-    else:
-        for r in range(n):
-            encode_row(r)
+    for r in range(n):
+        encode_row(r)
 
 
 @export("mf_pq_decode")
@@ -479,11 +468,8 @@ def mf_pq_scan(
                     ]
             insert_topk(distances, ids, base, k, value, vector_ids[r], metric)
 
-    if nq > 1 and nq * nb >= PARALLEL_SCAN_WORK:
-        parallelize(scan_query, nq, PARALLEL_WORKERS)
-    else:
-        for q in range(nq):
-            scan_query(q)
+    for q in range(nq):
+        scan_query(q)
 
 
 @export("mf_ivfpq_search")
@@ -600,8 +586,5 @@ def mf_ivfpq_search(
                         ]
                 insert_topk(distances, ids, base, k, value, vector_ids[pos], metric)
 
-    if nq > 1 and nq * nprobe * d >= PARALLEL_SCAN_WORK:
-        parallelize(search_query, nq, IVFPQ_WORKERS)
-    else:
-        for q in range(nq):
-            search_query(q)
+    for q in range(nq):
+        search_query(q)
